@@ -319,7 +319,8 @@ t_gen, t_dia, t_sem, t_mes, t_diag = st.tabs(
 # ───────────────────────── MATRIZ GENERAL ─────────────────────────
 with t_gen:
     st.subheader("Consolidado por operador logístico")
-    tot_op = recs_eval.merge(roster[["key", "operador"]], on="key").groupby("operador").size().rename("Asistencias")
+    tot_op = (recs_eval.drop(columns="operador").merge(roster[["key", "operador"]], on="key")
+              .groupby("operador").size().rename("Asistencias"))
     op = grid.groupby("operador").agg(Personas=("key", "nunique"),
                                       **{"Semanas activas": ("vac", lambda s: int((~s).sum()))},
                                       **{"Semanas cumplidas": ("cumple", "sum")},
