@@ -1,11 +1,11 @@
 import re
 import unicodedata
 from datetime import date
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
 
 # ───────────────────────── CONFIGURACIÓN ─────────────────────────
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/105lSTWCMAiXiG-zTaCZO6ZFtp-K4R1U1NEL1N4Vpess/edit"
@@ -83,18 +83,27 @@ def estado(p):
 
 
 # ───────────────────────── CARGA Y LIMPIEZA ─────────────────────────
+def leer_hoja(nombre):
+    """Lee una pestaña como CSV (la planilla debe estar compartida: cualquiera con el enlace, Lector)."""
+    doc_id = re.search(r"/d/([\w-]+)", SPREADSHEET_URL).group(1)
+    url = (f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq"
+           f"?tqx=out:csv&headers=1&sheet={quote(nombre, safe='')}")
+    return pd.read_csv(url)
+
+
 @st.cache_data(ttl=CACHE_TTL, show_spinner="Leyendo Google Sheets…")
 def cargar(ws_resp, ws_vac, ws_padron):
-    conn = st.connection("gsheets", type=GSheetsConnection)
-    resp = conn.read(spreadsheet=SPREADSHEET_URL, worksheet=ws_resp, ttl=0)
+    resp = leer_hoja(ws_resp)
 
     def leer_opcional(ws):
         if not ws:
             return None
         try:
-            return conn.read(spreadsheet=SPREADSHEET_URL, worksheet=ws, ttl=0)
+            df = leer_hoja(ws)
         except Exception:
             return None
+        # si el nombre no existe, Google puede devolver otra pestaña: se descarta
+        return None if list(df.columns) == list(resp.columns) else df
 
     return resp, leer_opcional(ws_vac), leer_opcional(ws_padron)
 
@@ -199,7 +208,13 @@ def preparar_padron(raw):
 # ───────────────────────── DATOS ─────────────────────────
 st.title("🕖 Control de Asistencia Matinal")
 
-raw_resp, raw_vac, raw_pad = cargar(WS_RESPUESTAS, WS_VACACIONES, WS_PADRON)
+try:
+    raw_resp, raw_vac, raw_pad = cargar(WS_RESPUESTAS, WS_VACACIONES, WS_PADRON)
+except Exception as e:
+    st.error("No pude leer la planilla. Verificá que esté compartida como 'Cualquier persona con el enlace → Lector' "
+             "y que el nombre de la pestaña sea exacto.")
+    st.code(f"{type(e).__name__}: {e}")
+    st.stop()
 asist_all, info = preparar_respuestas(raw_resp)
 vac_df = preparar_vacaciones(raw_vac)
 padron = preparar_padron(raw_pad)
