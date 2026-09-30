@@ -11,7 +11,6 @@ import streamlit as st
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/105lSTWCMAiXiG-zTaCZO6ZFtp-K4R1U1NEL1N4Vpess/edit"
 WS_RESPUESTAS = "Respuestas de formulario 1"
 WS_VACACIONES = "Vacaciones 2026"   # nombre exacto de la pestaña de vacaciones/ausencias
-WS_PADRON = None                    # opcional: pestaña con el padrón completo (ej. "Datos")
 UMBRAL = 3                          # asistencias mínimas por semana para el 100%
 CACHE_TTL = 300                     # segundos entre lecturas de Google Sheets
 MESES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
@@ -92,7 +91,7 @@ def leer_hoja(nombre):
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner="Leyendo Google Sheets…")
-def cargar(ws_resp, ws_vac, ws_padron):
+def cargar(ws_resp, ws_vac):
     resp = leer_hoja(ws_resp)
 
     def leer_opcional(ws):
@@ -105,7 +104,7 @@ def cargar(ws_resp, ws_vac, ws_padron):
         # si el nombre no existe, Google puede devolver otra pestaña: se descarta
         return None if list(df.columns) == list(resp.columns) else df
 
-    return resp, leer_opcional(ws_vac), leer_opcional(ws_padron)
+    return resp, leer_opcional(ws_vac)
 
 
 def preparar_respuestas(raw):
@@ -190,22 +189,34 @@ def preparar_vacaciones(raw):
     return pd.DataFrame(filas, columns=cols).drop_duplicates(["key", "semana"])
 
 
-def preparar_padron(raw):
-    if raw is None or raw.dropna(how="all").empty:
-        return pd.DataFrame(columns=["key", "persona"])
-    df = raw.dropna(how="all").copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    c_nom = buscar_col(df, "apellido", "nombre") or df.columns[0]
-    out = pd.DataFrame({"persona": df[c_nom].map(clean_name)})
-    out["key"] = out["persona"].map(norm_key)
-    return out[out["key"].ne("")].drop_duplicates("key")
+def _tokens(txt):
+    return [t for t in re.split(r"[^A-Z0-9]+", norm_key(txt)) if t]
+
+
+def vincular_vacaciones(vac, nombres):
+    """Asocia cada nombre de vacaciones con un nombre de 'Respuestas' (exacto o abreviado).
+    nombres: dict key -> persona. Sin coincidencia única, key queda vacía y no se aplica."""
+    if vac.empty:
+        return vac
+    tok = {k: _tokens(n) for k, n in nombres.items()}
+    claves = []
+    for _, r in vac.iterrows():
+        if r["key"] in nombres:
+            claves.append(r["key"])
+            continue
+        vt = _tokens(r["persona"])
+        cand = [k for k, t in tok.items() if vt and all(any(x.startswith(v) for x in t) for v in vt)]
+        claves.append(cand[0] if len(cand) == 1 else "")
+    out = vac.copy()
+    out["key"] = claves
+    return out
 
 
 # ───────────────────────── DATOS ─────────────────────────
 st.title("🕖 Control de Asistencia Matinal")
 
 try:
-    raw_resp, raw_vac, raw_pad = cargar(WS_RESPUESTAS, WS_VACACIONES, WS_PADRON)
+    raw_resp, raw_vac = cargar(WS_RESPUESTAS, WS_VACACIONES)
 except Exception as e:
     st.error("No pude leer la planilla. Verificá que esté compartida como 'Cualquier persona con el enlace → Lector' "
              "y que el nombre de la pestaña sea exacto.")
@@ -213,7 +224,6 @@ except Exception as e:
     st.stop()
 asist_all, info = preparar_respuestas(raw_resp)
 vac_df = preparar_vacaciones(raw_vac)
-padron = preparar_padron(raw_pad)
 if raw_vac is None:
     st.warning(f"No pude leer la pestaña '{WS_VACACIONES}'. Se calcula sin excepciones de vacaciones.")
 
@@ -236,17 +246,11 @@ d1, d2 = rango
 meses_sel = sb.multiselect("Mes", sorted(base["mes"].unique()), format_func=lambda m: MESES[m - 1])
 sem_sel = sb.multiselect("Semana", sorted(base["semana"].unique()))
 
-# Padrón: todos los que aparecen en respuestas del año, vacaciones y (opcional) padrón
+# Listado de personas: solo los nombres de la pestaña "Respuestas de formulario 1"
 roster = (base.sort_values("fecha").groupby("key")
-          .agg(persona=("persona", "last")).reset_index())
-extras = pd.concat([
-    vac_df[["key", "persona"]].drop_duplicates("key"),
-    padron[["key", "persona"]],
-]).drop_duplicates("key")
-extras = extras[~extras["key"].isin(roster["key"])]
-if len(extras):
-    roster = pd.concat([roster, extras], ignore_index=True)
-roster = roster.sort_values("persona").reset_index(drop=True)
+          .agg(persona=("persona", "last")).reset_index()
+          .sort_values("persona").reset_index(drop=True))
+vac_df = vincular_vacaciones(vac_df, dict(zip(roster["key"], roster["persona"])))
 
 q = sb.text_input("Buscar nombre / apellido")
 excluir_en_curso = sb.checkbox("Excluir semana en curso del cálculo", value=True,
@@ -383,9 +387,9 @@ with t_diag:
     if info["desfase_mes"]:
         st.warning(f"{info['desfase_mes']} filas tienen un mes en 'Fecha' distinto a la columna 'Mes'. "
                    "Revisá el formato de fecha (debe ser día/mes/año).")
-    sin_match = vac_df[~vac_df["key"].isin(asist_all["key"])]["persona"].drop_duplicates()
+    sin_match = vac_df[vac_df["key"] == ""]["persona"].drop_duplicates()
     if len(sin_match):
-        st.info("Personas de la pestaña de vacaciones sin ninguna marca en 'Respuestas' "
-                "(pueden ser nombres escritos distinto): " + ", ".join(sin_match))
+        st.warning("Estos nombres de la pestaña de vacaciones no coinciden con una única persona de 'Respuestas' "
+                   "y NO se aplicaron: " + ", ".join(sin_match))
     st.markdown("**Vacaciones / ausencias interpretadas**")
     mostrar(vac_df.drop(columns="key").rename(columns={"persona": "Persona", "semana": "Semana", "motivo": "Motivo"}))
