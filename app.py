@@ -117,7 +117,6 @@ def preparar_respuestas(raw):
     c_sem = buscar_col(df, "semana", exacto=True)
     c_mes = buscar_col(df, "mes", exacto=True)
     c_anio = buscar_col(df, "ano", exacto=True)
-    c_op = buscar_col(df, "operador")
     if not c_nom or not (c_fecha or c_marca):
         st.error("No encuentro las columnas 'Apellido y nombre' y 'Fecha'/'Marca temporal' en la pestaña de respuestas.")
         st.stop()
@@ -134,7 +133,6 @@ def preparar_respuestas(raw):
         "persona": df[c_nom].map(clean_name),
         "fecha": fecha,
         "hora": marca.dt.strftime("%H:%M:%S"),
-        "operador": (df[c_op] if c_op else pd.Series("Sin dato", index=df.index)).fillna("Sin dato").map(clean_name),
     })
     iso = out["fecha"].dt.isocalendar()
     out["semana"] = num(c_sem).fillna(iso.week.astype("float"))
@@ -194,13 +192,11 @@ def preparar_vacaciones(raw):
 
 def preparar_padron(raw):
     if raw is None or raw.dropna(how="all").empty:
-        return pd.DataFrame(columns=["key", "persona", "operador"])
+        return pd.DataFrame(columns=["key", "persona"])
     df = raw.dropna(how="all").copy()
     df.columns = [str(c).strip() for c in df.columns]
     c_nom = buscar_col(df, "apellido", "nombre") or df.columns[0]
-    c_op = buscar_col(df, "operador")
     out = pd.DataFrame({"persona": df[c_nom].map(clean_name)})
-    out["operador"] = df[c_op].fillna("Sin dato").map(clean_name) if c_op else "Sin dato"
     out["key"] = out["persona"].map(norm_key)
     return out[out["key"].ne("")].drop_duplicates("key")
 
@@ -242,23 +238,20 @@ sem_sel = sb.multiselect("Semana", sorted(base["semana"].unique()))
 
 # Padrón: todos los que aparecen en respuestas del año, vacaciones y (opcional) padrón
 roster = (base.sort_values("fecha").groupby("key")
-          .agg(persona=("persona", "last"), operador=("operador", "last")).reset_index())
+          .agg(persona=("persona", "last")).reset_index())
 extras = pd.concat([
-    vac_df[["key", "persona"]].drop_duplicates("key").assign(operador="Sin dato"),
-    padron[["key", "persona", "operador"]],
+    vac_df[["key", "persona"]].drop_duplicates("key"),
+    padron[["key", "persona"]],
 ]).drop_duplicates("key")
 extras = extras[~extras["key"].isin(roster["key"])]
 if len(extras):
     roster = pd.concat([roster, extras], ignore_index=True)
 roster = roster.sort_values("persona").reset_index(drop=True)
 
-ops = sb.multiselect("Operador logístico", sorted(roster["operador"].unique()))
 q = sb.text_input("Buscar nombre / apellido")
 excluir_en_curso = sb.checkbox("Excluir semana en curso del cálculo", value=True,
                                help="La semana que todavía no terminó penalizaría el cumplimiento.")
 
-if ops:
-    roster = roster[roster["operador"].isin(ops)]
 if q.strip():
     roster = roster[roster["key"].str.contains(norm_key(q), regex=False)]
 if roster.empty:
@@ -289,7 +282,7 @@ recs_eval = recs[recs["semana"].isin(semanas_tbl["semana"])]
 vac_set = set(zip(vac_df["key"], vac_df["semana"]))
 
 # ───────────────────────── CÁLCULO ─────────────────────────
-grid = roster[["key", "persona", "operador"]].merge(semanas_tbl[["semana", "mes"]], how="cross")
+grid = roster[["key", "persona"]].merge(semanas_tbl[["semana", "mes"]], how="cross")
 cnt = recs_eval.groupby(["key", "semana"]).size().rename("asistencias").reset_index()
 grid = grid.merge(cnt, on=["key", "semana"], how="left")
 grid["asistencias"] = grid["asistencias"].fillna(0).astype(int)
@@ -318,24 +311,12 @@ t_gen, t_dia, t_sem, t_mes, t_diag = st.tabs(
 
 # ───────────────────────── MATRIZ GENERAL ─────────────────────────
 with t_gen:
-    st.subheader("Consolidado por operador logístico")
-    tot_op = (recs_eval.drop(columns="operador").merge(roster[["key", "operador"]], on="key")
-              .groupby("operador").size().rename("Asistencias"))
-    op = grid.groupby("operador").agg(Personas=("key", "nunique"),
-                                      **{"Semanas activas": ("vac", lambda s: int((~s).sum()))},
-                                      **{"Semanas cumplidas": ("cumple", "sum")},
-                                      **{"% Cumplimiento": ("pct", "mean")}).join(tot_op).reset_index()
-    op = op.rename(columns={"operador": "Operador logístico"})
-    op["Asistencias"] = op["Asistencias"].fillna(0).astype(int)
-    mostrar_pct(op[["Operador logístico", "Personas", "Asistencias", "Semanas activas",
-                    "Semanas cumplidas", "% Cumplimiento"]], ["% Cumplimiento"])
-
     st.subheader("Listado completo de personas")
-    m = res.rename(columns={"persona": "Persona", "operador": "Operador logístico", "total": "Total asistencias",
+    m = res.rename(columns={"persona": "Persona", "total": "Total asistencias",
                             "activas": "Semanas activas", "vacs": "Semanas vacaciones/licencia",
                             "cumplidas": "Semanas cumplidas", "pct": "% Cumplimiento"})
     m["Estado"] = m["% Cumplimiento"].map(estado)
-    mostrar_pct(m[["Persona", "Operador logístico", "Total asistencias", "Semanas activas",
+    mostrar_pct(m[["Persona", "Total asistencias", "Semanas activas",
                    "Semanas vacaciones/licencia", "Semanas cumplidas", "% Cumplimiento", "Estado"]],
                 ["% Cumplimiento"])
     st.download_button("⬇️ Descargar CSV", m.to_csv(index=False).encode("utf-8-sig"),
@@ -348,7 +329,7 @@ with t_dia:
     del_dia = recs[recs["fecha"].dt.date == dia]
     sem_dia = int(del_dia["semana"].mode().iat[0])
     horas = del_dia.set_index("key")["hora"]
-    d = roster[["key", "persona", "operador"]].copy()
+    d = roster[["key", "persona"]].copy()
     d["hora"] = d["key"].map(horas)
     d["vac"] = [(k, sem_dia) in vac_set for k in d["key"]]
     d["Estado"] = np.where(d["hora"].notna(), "✅ Asistió",
@@ -362,8 +343,8 @@ with t_dia:
         d = d[d["Estado"] == "✅ Asistió"]
     elif filtro == "Solo no asistieron":
         d = d[d["Estado"] == "❌ No asistió"]
-    mostrar(d.rename(columns={"persona": "Persona", "operador": "Operador logístico", "hora": "Hora de marca"})
-            [["Persona", "Operador logístico", "Estado", "Hora de marca"]])
+    mostrar(d.rename(columns={"persona": "Persona", "hora": "Hora de marca"})
+            [["Persona", "Estado", "Hora de marca"]])
     st.markdown("**Asistentes por día (período filtrado)**")
     st.bar_chart(recs[recs["key"].isin(roster["key"])].groupby("fecha").size())
 
@@ -371,9 +352,9 @@ with t_dia:
 with t_sem:
     grid["celda"] = [("🏖 Vac." if v else (f"{n} ✅" if n >= UMBRAL else f"{n} ⚠️"))
                      for n, v in zip(grid["asistencias"], grid["vac"])]
-    piv = grid.pivot(index=["persona", "operador"], columns="semana", values="celda")
+    piv = grid.pivot(index="persona", columns="semana", values="celda")
     piv.columns = [f"S{c}" for c in piv.columns]
-    piv = piv.reset_index().rename(columns={"persona": "Persona", "operador": "Operador logístico"})
+    piv = piv.reset_index().rename(columns={"persona": "Persona"})
     st.caption(f"✅ = {UMBRAL} o más asistencias · ⚠️ = menos de {UMBRAL} · 🏖 = vacaciones/ausente/suspendido (no se evalúa)")
     mostrar(piv.style.map(estilo_celda, subset=[c for c in piv.columns if c.startswith("S")]))
     st.markdown("**Cumplimiento promedio por semana**")
@@ -388,18 +369,12 @@ with t_sem:
 with t_mes:
     gm = grid.groupby(["key", "mes"])["pct"].mean().unstack("mes")
     gm.columns = [MESES[int(c) - 1] for c in gm.columns]
-    gm = roster[["key", "persona", "operador"]].merge(gm.reset_index(), on="key", how="left")
+    gm = roster[["key", "persona"]].merge(gm.reset_index(), on="key", how="left")
     gm = gm.merge(res[["key", "pct"]], on="key").drop(columns="key")
-    gm = gm.rename(columns={"persona": "Persona", "operador": "Operador logístico", "pct": "Total período"})
-    cols_pct = [c for c in gm.columns if c not in ("Persona", "Operador logístico")]
+    gm = gm.rename(columns={"persona": "Persona", "pct": "Total período"})
+    cols_pct = [c for c in gm.columns if c != "Persona"]
     st.caption("Cada mes agrega los resultados semanales (semanas asignadas al mes con más días de marcas).")
-    st.subheader("Por persona")
     mostrar_pct(gm, cols_pct)
-    st.subheader("Por operador logístico")
-    go = grid.groupby(["operador", "mes"])["pct"].mean().unstack("mes")
-    go.columns = [MESES[int(c) - 1] for c in go.columns]
-    go = go.reset_index().rename(columns={"operador": "Operador logístico"})
-    mostrar_pct(go, [c for c in go.columns if c != "Operador logístico"])
 
 # ───────────────────────── DIAGNÓSTICO ─────────────────────────
 with t_diag:
