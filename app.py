@@ -11,6 +11,7 @@ import streamlit as st
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/105lSTWCMAiXiG-zTaCZO6ZFtp-K4R1U1NEL1N4Vpess/edit"
 WS_RESPUESTAS = "Respuestas de formulario 1"
 WS_VACACIONES = "Vacaciones 2026"   # nombre exacto de la pestaña de vacaciones/ausencias
+EXCLUIDOS = ["ROA, JOSE MARIA", "SEGOVIA, ALDO GUILLERMO"]  # personas que no se consideran en ningún cálculo
 UMBRAL = 3                          # asistencias mínimas por semana para el 100%
 CACHE_TTL = 300                     # segundos entre lecturas de Google Sheets
 MESES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
@@ -229,7 +230,10 @@ except Exception as e:
     st.code(f"{type(e).__name__}: {e}")
     st.stop()
 asist_all, info = preparar_respuestas(raw_resp)
+asist_all = asist_all[~asist_all["key"].isin({norm_key(n) for n in EXCLUIDOS})]
 vac_df = preparar_vacaciones(raw_vac)
+if len(vac_df):  # ignorar también las ausencias cargadas para las personas excluidas
+    vac_df = vac_df[vincular_vacaciones(vac_df, {norm_key(n): n for n in EXCLUIDOS})["key"].eq("").values]
 if raw_vac is None:
     st.warning(f"No pude leer la pestaña '{WS_VACACIONES}'. Se calcula sin excepciones de vacaciones.")
 
@@ -258,10 +262,13 @@ roster = (base.sort_values("fecha").groupby("key")
           .sort_values("persona").reset_index(drop=True))
 vac_df = vincular_vacaciones(vac_df, dict(zip(roster["key"], roster["persona"])))
 
+nombres_sel = sb.multiselect("Nombre", list(roster["persona"]), placeholder="Todas las personas")
 q = sb.text_input("Buscar nombre / apellido")
 excluir_en_curso = sb.checkbox("Excluir semana en curso del cálculo", value=True,
                                help="La semana que todavía no terminó penalizaría el cumplimiento.")
 
+if nombres_sel:
+    roster = roster[roster["persona"].isin(nombres_sel)]
 if q.strip():
     roster = roster[roster["key"].str.contains(norm_key(q), regex=False)]
 if roster.empty:
