@@ -166,9 +166,13 @@ def preparar_vacaciones(raw):
         return pd.DataFrame(columns=cols)
     df = raw.dropna(how="all").copy()
     df.columns = [str(c).strip() for c in df.columns]
-    c_nom = buscar_col(df, "apellido", "nombre", "persona", "empleado") or df.columns[0]
+    c_nom = (buscar_col(df, "nombre completo", exacto=True) or buscar_col(df, "nombre completo")
+             or buscar_col(df, "apellido", "nombre", "persona", "empleado") or df.columns[0])
     c_mot = buscar_col(df, "motivo", "tipo", "estado", "novedad")
-    cols_sem = [c for c in df.columns if "semana" in norm_col(c)]
+    if c_mot == c_nom:
+        c_mot = None
+    c_sem = buscar_col(df, "semana", exacto=True)
+    cols_sem = [c_sem] if c_sem else [c for c in df.columns if "semana" in norm_col(c)]
     filas = []
     for _, r in df.iterrows():
         nom = clean_name(r[c_nom])
@@ -205,7 +209,9 @@ def vincular_vacaciones(vac, nombres):
             claves.append(r["key"])
             continue
         vt = _tokens(r["persona"])
-        cand = [k for k, t in tok.items() if vt and all(any(x.startswith(v) for x in t) for v in vt)]
+        cand = [k for k, t in tok.items() if vt and (
+            all(any(x.startswith(v) for x in t) for v in vt)      # abreviado o en otro orden
+            or all(any(v.startswith(x) for v in vt) for x in t))]  # nombre más largo en vacaciones
         claves.append(cand[0] if len(cand) == 1 else "")
     out = vac.copy()
     out["key"] = claves
