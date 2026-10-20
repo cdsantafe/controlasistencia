@@ -1,408 +1,434 @@
-import re
-import unicodedata
-from datetime import date
-from urllib.parse import quote
+"""
+Dashboard de Control - TAREA CRÍTICA: NOTIFICACIÓN AL CLIENTE (BEES Deliver)
+Ejecutar local:  streamlit run app.py
+"""
+from html import escape
+from io import BytesIO
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 
-# ───────────────────────── CONFIGURACIÓN ─────────────────────────
-SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/105lSTWCMAiXiG-zTaCZO6ZFtp-K4R1U1NEL1N4Vpess/edit"
-WS_RESPUESTAS = "Respuestas de formulario 1"
-WS_VACACIONES = "Vacaciones 2026"   # nombre exacto de la pestaña de vacaciones/ausencias
-EXCLUIDOS = ["ROA, JOSE MARIA", "SEGOVIA, ALDO GUILLERMO"]  # personas que no se consideran en ningún cálculo
-UMBRAL = 3                          # asistencias mínimas por semana para el 100%
-CACHE_TTL = 300                     # segundos entre lecturas de Google Sheets
-MESES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+# ----------------------------------------------------------------------
+# Configuración general
+# ----------------------------------------------------------------------
+OBJETIVO = 88.0                      # % objetivo de notificación > 2 min
+ARCHIVO_DEFECTO = "routes-data_2026-10-19_14h1m.csv"
+COLUMNAS_REQ = ["driver_name", "driver_notification_time", "arrived_at"]
+ZONA_LOCAL = "America/Argentina/Buenos_Aires"   # las marcas ISO8601 vienen en UTC
 
-st.set_page_config(page_title="Control Asistencia Matinal", page_icon="🕖", layout="wide")
+st.set_page_config(page_title="Notificación al Cliente", page_icon="📲", layout="wide")
 
+# ----------------------------------------------------------------------
+# CSS personalizado (imita la planilla de control)
+# ----------------------------------------------------------------------
+st.markdown(
+    """
+    <style>
+    .titulo {color:#D32F2F; font-size:2.4rem; font-weight:800; margin-bottom:0; letter-spacing:.5px;}
+    .subtitulo {color:#444; font-size:1.2rem; font-weight:600; margin-top:0;}
+    .resumen {width:100%; border-collapse:collapse; margin:10px 0 20px 0;}
+    .resumen th {background:#FFC933; color:#222; padding:10px; text-align:center;
+                 border:1px solid #d9a800; font-size:.95rem;}
+    .resumen td {padding:12px; text-align:center; font-size:1.5rem; font-weight:700;
+                 border:1px solid #ddd;}
+    .ok  {background:#C8E6C9; color:#1B5E20;}
+    .bad {background:#FFCDD2; color:#B71C1C;}
+    .neu {background:#FFF8E1; color:#333;}
+                      border-top:4px solid #D32F2F; border-bottom:4px solid #D32F2F;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# ───────────────────────── UTILIDADES ─────────────────────────
-def clean_name(s):
-    return re.sub(r"\s+", " ", str(s)).strip() if pd.notna(s) else ""
-
-
-def norm_key(s):
-    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode()
-    return re.sub(r"\s+", " ", s).strip().upper()
-
-
-def norm_col(c):
-    return norm_key(c).lower()
-
-
-def buscar_col(df, *claves, exacto=False):
-    for c in df.columns:
-        n = norm_col(c)
-        if any((n == k) if exacto else (k in n) for k in claves):
-            return c
-    return None
-
-
-def mostrar(obj):
-    try:
-        st.dataframe(obj, width="stretch", hide_index=True)
-    except TypeError:
-        st.dataframe(obj, use_container_width=True, hide_index=True)
-
-
-def estilo_pct(v):
-    if pd.isna(v):
-        return "background-color:#e5e7eb;color:#374151"
-    if v >= 99.999:
-        return "background-color:#bbf7d0;color:#14532d"
-    if v >= 70:
-        return "background-color:#fef08a;color:#713f12"
-    return "background-color:#fecaca;color:#7f1d1d"
+# ----------------------------------------------------------------------
+# Carga y preparación de datos
+# ----------------------------------------------------------------------
+def leer_archivo(origen) -> pd.DataFrame:
+    """Lee CSV o Excel desde un uploader o una ruta."""
+    nombre = getattr(origen, "name", str(origen)).lower()
+    if hasattr(origen, "seek"):
+        origen.seek(0)  # los archivos del uploader se releen en cada ejecución
+    if nombre.endswith((".xlsx", ".xls")):
+        return pd.read_excel(origen)
+    return pd.read_csv(origen, sep=None, engine="python")  # detecta separador
 
 
-def estilo_celda(v):
-    v = str(v)
-    if v.startswith("🏖"):
-        return "background-color:#e5e7eb;color:#374151"
-    if "✅" in v:
-        return "background-color:#bbf7d0;color:#14532d"
-    if v.startswith("0"):
-        return "background-color:#fecaca;color:#7f1d1d"
-    return "background-color:#fef08a;color:#713f12"
+CLAVE_VISITA = ["tour_display_id", "visit_order", "driver_name"]
 
 
-def mostrar_pct(df, cols):
-    sty = df.style.map(estilo_pct, subset=cols).format({c: "{:.0f}%" for c in cols}, na_rep="—")
-    mostrar(sty)
-
-
-def estado(p):
-    if pd.isna(p):
-        return "⚪ Sin semanas activas"
-    if p >= 99.999:
-        return "🟢 100%"
-    return "🟡 Parcial" if p >= 70 else "🔴 Bajo"
-
-
-# ───────────────────────── CARGA Y LIMPIEZA ─────────────────────────
-def leer_hoja(nombre):
-    """Lee una pestaña como CSV (la planilla debe estar compartida: cualquiera con el enlace, Lector)."""
-    doc_id = re.search(r"/d/([\w-]+)", SPREADSHEET_URL).group(1)
-    url = (f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq"
-           f"?tqx=out:csv&headers=1&sheet={quote(nombre, safe='')}")
-    return pd.read_csv(url)
-
-
-@st.cache_data(ttl=CACHE_TTL, show_spinner="Leyendo Google Sheets…")
-def cargar(ws_resp, ws_vac):
-    resp = leer_hoja(ws_resp)
-
-    def leer_opcional(ws):
-        if not ws:
-            return None
+def unir_archivos(archivos) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Lee y concatena varios archivos. Devuelve (datos, resumen por archivo).
+    Si una visita aparece en más de un archivo, se conserva la del último archivo cargado."""
+    partes, resumen = [], []
+    for a in archivos:
         try:
-            df = leer_hoja(ws)
-        except Exception:
-            return None
-        # si el nombre no existe, Google puede devolver otra pestaña: se descarta
-        return None if list(df.columns) == list(resp.columns) else df
+            df = leer_archivo(a)
+        except Exception as e:  # archivo ilegible: se informa y se sigue con los demás
+            st.warning(f"No se pudo leer {a.name}: {e}")
+            continue
+        df["archivo_origen"] = a.name
+        partes.append(df)
+        resumen.append({"Archivo": a.name, "Filas": len(df)})
+    if not partes:
+        return pd.DataFrame(), pd.DataFrame(resumen)
 
-    return resp, leer_opcional(ws_vac)
+    datos = pd.concat(partes, ignore_index=True)
+    antes = len(datos)
+    if all(c in datos.columns for c in CLAVE_VISITA):
+        datos = datos.drop_duplicates(subset=CLAVE_VISITA, keep="last")
+    else:
+        datos = datos.drop_duplicates(subset=[c for c in datos.columns if c != "archivo_origen"], keep="last")
+    st.session_state["duplicadas"] = antes - len(datos)
+    return datos.reset_index(drop=True), pd.DataFrame(resumen)
 
 
-def preparar_respuestas(raw):
-    df = raw.dropna(how="all").copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    c_nom = buscar_col(df, "apellido y nombre", "apellido")
-    c_fecha = buscar_col(df, "fecha", exacto=True)
-    c_marca = buscar_col(df, "marca temporal")
-    c_sem = buscar_col(df, "semana", exacto=True)
-    c_mes = buscar_col(df, "mes", exacto=True)
-    c_anio = buscar_col(df, "ano", exacto=True)
-    if not c_nom or not (c_fecha or c_marca):
-        st.error("No encuentro las columnas 'Apellido y nombre' y 'Fecha'/'Marca temporal' en la pestaña de respuestas.")
+def datos_demo() -> pd.DataFrame:
+    """Datos de demostración cuando no hay archivo."""
+    rng = np.random.default_rng(7)
+    choferes = ["Chofer A", "Chofer B", "Chofer C", "Chofer D", "Chofer E"]
+    filas = []
+    for dia in pd.date_range("2026-10-12", periods=7):
+        for ch in choferes:
+            for _ in range(rng.integers(15, 30)):
+                llegada = dia + pd.Timedelta(hours=int(rng.integers(8, 17)), minutes=int(rng.integers(0, 60)))
+                anticipo = max(rng.normal(240 if ch < "D" else 100, 90), 0)
+                filas.append({
+                    "driver_name": ch,
+                    "tour_display_id": f"P{choferes.index(ch)+1:03d}",
+                    "tour_date": dia.date().isoformat(),
+                    "driver_notification_time": (llegada - pd.Timedelta(seconds=anticipo)).isoformat() + "Z",
+                    "arrived_at": llegada.isoformat() + "Z" if rng.random() > 0.05 else None,
+                })
+    return pd.DataFrame(filas)
+
+
+def preparar(df: pd.DataFrame) -> pd.DataFrame:
+    """Calcula anticipación y banderas de cumplimiento."""
+    faltan = [c for c in COLUMNAS_REQ if c not in df.columns]
+    if faltan:
+        st.error(f"Faltan columnas en el archivo: {', '.join(faltan)}")
         st.stop()
 
-    vacio = pd.Series(pd.NaT, index=df.index)
-    marca = pd.to_datetime(df[c_marca], dayfirst=True, errors="coerce") if c_marca else vacio
-    fecha = pd.to_datetime(df[c_fecha], dayfirst=True, errors="coerce") if c_fecha else vacio
-    fecha = fecha.fillna(marca).dt.normalize()
+    df = df.copy()
+    # format="ISO8601": acepta marcas con y sin milisegundos en la misma columna
+    df["arrived_at"] = pd.to_datetime(df["arrived_at"], utc=True, errors="coerce", format="ISO8601")
+    df["driver_notification_time"] = pd.to_datetime(df["driver_notification_time"], utc=True, errors="coerce", format="ISO8601")
 
-    def num(c):
-        return pd.to_numeric(df[c], errors="coerce") if c else pd.Series(np.nan, index=df.index)
+    # Fecha de la ruta: tour_date > trip_start_timestamp > fecha de llegada
+    if "tour_date" in df.columns:
+        fecha = pd.to_datetime(df["tour_date"], errors="coerce")
+    elif "trip_start_timestamp" in df.columns:
+        fecha = pd.to_datetime(df["trip_start_timestamp"], utc=True, errors="coerce", format="ISO8601").dt.tz_localize(None)
+    else:
+        fecha = df["arrived_at"].dt.tz_localize(None)
+    df["fecha"] = fecha.dt.normalize()
 
-    out = pd.DataFrame({
-        "persona": df[c_nom].map(clean_name),
-        "fecha": fecha,
-        "hora": marca.dt.strftime("%H:%M:%S"),
-    })
-    iso = out["fecha"].dt.isocalendar()
-    out["semana"] = num(c_sem).fillna(iso.week.astype("float"))
-    out["anio"] = num(c_anio).fillna(iso.year.astype("float"))
-    out["mes"] = num(c_mes).fillna(out["fecha"].dt.month.astype("float"))
-    out["key"] = out["persona"].map(norm_key)
+    if "tour_display_id" not in df.columns:
+        df["tour_display_id"] = "N/D"
 
-    valido = out["key"].ne("") & out["fecha"].notna()
-    invalidas = int((~valido).sum())
-    out = out[valido].copy()
-    for c in ("semana", "anio", "mes"):
-        out[c] = out[c].astype(int)
-    desfase = int((out["fecha"].dt.month != out["mes"]).sum())
+    # Regla 1: excluir visitas sin llegada
+    df = df[df["arrived_at"].notna() & df["fecha"].notna()].copy()
 
-    out = out.sort_values(["fecha", "hora"])
-    n_antes = len(out)
-    out = out.drop_duplicates(["key", "fecha"], keep="first").reset_index(drop=True)  # 1 asistencia por persona y día
-    info = {"filas": len(raw), "invalidas": invalidas, "duplicadas": n_antes - len(out), "desfase_mes": desfase}
-    return out, info
+    # Reglas 2 y 3: anticipación en segundos (sin notificación => no cumple)
+    df["anticipacion_seg"] = (df["arrived_at"] - df["driver_notification_time"]).dt.total_seconds()
+    df["cumple_2"] = df["anticipacion_seg"] >= 120
+    df["cumple_5"] = df["anticipacion_seg"] >= 300
+
+    # Hora local de la visita (para analizar la evolución durante el día)
+    df["hora"] = df["arrived_at"].dt.tz_convert(ZONA_LOCAL).dt.hour
+    return df
 
 
-def _rango_semanas(txt):
-    nums = [int(x) for x in re.findall(r"\d+", str(txt))]
-    if len(nums) == 2 and nums[0] < nums[1] and re.search(r"\d+\s*(-|–|al|a)\s*\d+", str(txt)):
-        return list(range(nums[0], nums[1] + 1))
-    return nums
+def asignar_periodo(df: pd.DataFrame, frecuencia: str) -> pd.DataFrame:
+    """Agrega la columna 'periodo' según la frecuencia elegida."""
+    df = df.copy()
+    if frecuencia == "Diario":
+        df["periodo"] = df["fecha"].dt.strftime("%Y-%m-%d")
+    elif frecuencia == "Semanal":
+        iso = df["fecha"].dt.isocalendar()
+        df["periodo"] = iso["year"].astype(str) + "-S" + iso["week"].astype(str).str.zfill(2)
+    else:
+        df["periodo"] = df["fecha"].dt.strftime("%Y-%m")
+    return df
 
 
-def preparar_vacaciones(raw):
-    cols = ["key", "persona", "semana", "motivo"]
-    if raw is None or raw.dropna(how="all").empty:
-        return pd.DataFrame(columns=cols)
-    df = raw.dropna(how="all").copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    c_nom = (buscar_col(df, "nombre completo", exacto=True) or buscar_col(df, "nombre completo")
-             or buscar_col(df, "apellido", "nombre", "persona", "empleado") or df.columns[0])
-    c_mot = buscar_col(df, "motivo", "tipo", "estado", "novedad")
-    if c_mot == c_nom:
-        c_mot = None
-    c_sem = buscar_col(df, "semana", exacto=True)
-    cols_sem = [c_sem] if c_sem else [c for c in df.columns if "semana" in norm_col(c)]
-    filas = []
-    for _, r in df.iterrows():
-        nom = clean_name(r[c_nom])
-        if not nom:
-            continue
-        if len(cols_sem) == 1:  # formato largo: una fila por persona/semana (o rango)
-            motivo = clean_name(r[c_mot]) if c_mot else "Vacaciones"
-            for s in _rango_semanas(r[cols_sem[0]]):
-                filas.append((norm_key(nom), nom, s, motivo))
-        else:  # formato ancho: una columna por semana, celda con contenido = ausente
-            for c in df.columns:
-                m = re.search(r"\d+", str(c))
-                if c == c_nom or c == c_mot or not m:
-                    continue
-                v = r[c]
-                if pd.notna(v) and str(v).strip() not in ("", "0", "False", "nan"):
-                    filas.append((norm_key(nom), nom, int(m.group()), clean_name(v)))
-    return pd.DataFrame(filas, columns=cols).drop_duplicates(["key", "semana"])
+def pct(serie: pd.Series) -> float:
+    return float(serie.mean() * 100) if len(serie) else np.nan
 
 
-def _tokens(txt):
-    return [t for t in re.split(r"[^A-Z0-9]+", norm_key(txt)) if t]
+# ----------------------------------------------------------------------
+# Estilos de tabla y tarjetas
+# ----------------------------------------------------------------------
+def color_celda(v):
+    if pd.isna(v):
+        return ""
+    return "background-color:#C8E6C9;color:#1B5E20" if v >= OBJETIVO else "background-color:#FFCDD2;color:#B71C1C"
 
 
-def vincular_vacaciones(vac, nombres):
-    """Asocia cada nombre de vacaciones con un nombre de 'Respuestas' (exacto o abreviado).
-    nombres: dict key -> persona. Sin coincidencia única, key queda vacía y no se aplica."""
-    if vac.empty:
-        return vac
-    tok = {k: _tokens(n) for k, n in nombres.items()}
-    claves = []
-    for _, r in vac.iterrows():
-        if r["key"] in nombres:
-            claves.append(r["key"])
-            continue
-        vt = _tokens(r["persona"])
-        cand = [k for k, t in tok.items() if vt and (
-            all(any(x.startswith(v) for x in t) for v in vt)      # abreviado o en otro orden
-            or all(any(v.startswith(x) for v in vt) for x in t))]  # nombre más largo en vacaciones
-        claves.append(cand[0] if len(cand) == 1 else "")
-    out = vac.copy()
-    out["key"] = claves
-    return out
+PLANTILLA_TABLA = """
+<style>
+  body {font-family: "Source Sans Pro", sans-serif; margin:0;}
+  #wrap {background:#fff; padding:4px;}
+  #wrap:fullscreen {padding:24px; overflow:auto;}
+  .barra {display:flex; gap:8px; justify-content:flex-end; margin-bottom:8px;}
+  .barra button {border:1px solid #d9a800; background:#FFF8E1; border-radius:6px; padding:6px 12px;
+                 cursor:pointer; font-size:.9rem;}
+  .barra button:hover {background:#FFC933;}
+  table {width:100%; border-collapse:collapse;}
+  th {background:#FFC933; color:#222; padding:10px; text-align:center; border:1px solid #d9a800;
+      cursor:pointer; user-select:none;}
+  th:hover {background:#FFB300;}
+  td {padding:8px 10px; text-align:center; border:1px solid #e0e0e0; font-size:1rem;}
+  td.nom {text-align:left;}
+  td.ok  {background:#C8E6C9; color:#1B5E20;}
+  td.bad {background:#FFCDD2; color:#B71C1C;}
+  tr.gral td {font-size:1.6rem; font-weight:800; padding:16px 10px;
+              border-top:4px solid #D32F2F; border-bottom:4px solid #D32F2F;}
+  tr.gral td.nom {background:#FFB300; color:#222; letter-spacing:1px;}
+  tr.gral td.cli {background:#FFE082; color:#222;}
+  tr.gral td.ok  {background:#2E7D32; color:#fff;}
+  tr.gral td.bad {background:#C62828; color:#fff;}
+  #wrap:fullscreen td {font-size:1.2rem;} #wrap:fullscreen tr.gral td {font-size:2rem;}
+</style>
+<div id="wrap">
+  <div class="barra">
+    <button onclick="fsTabla()">⛶ Maximizar tabla</button>
+    <button onclick="fsDash()">🖥️ Dashboard en pantalla completa</button>
+  </div>
+  <table id="t">__CABECERA__<tbody>__FILAS__</tbody></table>
+</div>
+<script>
+  const dirs = {};
+  function ordenar(i) {
+    const tb = document.querySelector('#t tbody');
+    const asc = dirs[i] === undefined ? false : !dirs[i];   // primer clic: mayor a menor
+    dirs[i] = asc;
+    const filas = Array.from(tb.rows);
+    filas.sort((a, b) => {
+      const x = a.cells[i], y = b.cells[i];
+      const vx = x.dataset.v !== undefined ? parseFloat(x.dataset.v) : x.textContent.toLowerCase();
+      const vy = y.dataset.v !== undefined ? parseFloat(y.dataset.v) : y.textContent.toLowerCase();
+      return (vx > vy ? 1 : vx < vy ? -1 : 0) * (asc ? 1 : -1);
+    });
+    filas.forEach(f => tb.appendChild(f));
+    document.querySelectorAll('#t th').forEach((th, k) => {
+      th.textContent = th.dataset.t + (k === i ? (asc ? ' ▲' : ' ▼') : '');
+    });
+  }
+  document.querySelectorAll('#t th').forEach((th, k) => {
+    th.dataset.t = th.textContent; th.onclick = () => ordenar(k);
+  });
+  function fsTabla() {
+    const w = document.getElementById('wrap');
+    if (document.fullscreenElement) { document.exitFullscreen(); return; }
+    w.requestFullscreen().catch(() => alert('Tu navegador bloqueó la pantalla completa.'));
+  }
+  function fsDash() {
+    try {
+      const d = window.parent.document;
+      if (d.fullscreenElement) { d.exitFullscreen(); return; }
+      d.documentElement.requestFullscreen().catch(() => alert('Usá F11 para pantalla completa.'));
+    } catch (e) { alert('Usá F11 para pantalla completa.'); }
+  }
+</script>
+"""
 
 
-# ───────────────────────── DATOS ─────────────────────────
-st.title("🕖 Control de Asistencia Matinal")
+def tabla_componente(tabla: pd.DataFrame) -> tuple[str, int]:
+    """Tabla HTML ordenable (clic en encabezados) con la fila GENERAL fija arriba."""
+    c2, c5 = "Notificaciones mayores a 2 minutos", "Notificaciones mayores a 5 minutos"
 
-try:
-    raw_resp, raw_vac = cargar(WS_RESPUESTAS, WS_VACACIONES)
-except Exception as e:
-    st.error("No pude leer la planilla. Verificá que esté compartida como 'Cualquier persona con el enlace → Lector' "
-             "y que el nombre de la pestaña sea exacto.")
-    st.code(f"{type(e).__name__}: {e}")
+    def fila(r, clase_tr=""):
+        k2, k5 = ("ok" if r[c2] >= OBJETIVO else "bad"), ("ok" if r[c5] >= OBJETIVO else "bad")
+        return (
+            f'<tr class="{clase_tr}"><td class="nom">{escape(str(r["CHOFER"]))}</td>'
+            f'<td class="cli" data-v="{int(r["Clientes"])}">{int(r["Clientes"])}</td>'
+            f'<td class="{k2}" data-v="{r[c2]:.4f}">{r[c2]:.0f}%</td>'
+            f'<td class="{k5}" data-v="{r[c5]:.4f}">{r[c5]:.0f}%</td></tr>'
+        )
+
+    gral = tabla[tabla["CHOFER"] == "GENERAL"].iloc[0]
+    choferes = tabla[tabla["CHOFER"] != "GENERAL"]
+    cabecera = (f"<thead><tr><th>CHOFER</th><th>Clientes</th><th>{c2}</th><th>{c5}</th></tr>"
+                f"{fila(gral, 'gral')}</thead>")
+    html = (PLANTILLA_TABLA.replace("__CABECERA__", cabecera)
+            .replace("__FILAS__", "".join(fila(r) for _, r in choferes.iterrows())))
+    alto = min(190 + 38 * len(choferes), 800)
+    return html, alto
+
+
+def clase(v):
+    return "neu" if pd.isna(v) else ("ok" if v >= OBJETIVO else "bad")
+
+
+def a_excel(tabla: pd.DataFrame) -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        tabla.to_excel(w, index=False, sheet_name="Notificación")
+    return buf.getvalue()
+
+
+# ----------------------------------------------------------------------
+# Encabezado
+# ----------------------------------------------------------------------
+st.markdown('<p class="titulo">TAREA CRÍTICA: NOTIFICACIÓN AL CLIENTE</p>', unsafe_allow_html=True)
+st.markdown(f'<p class="subtitulo">Objetivo: {OBJETIVO:.0f}% notificado con más de 2 minutos</p>',
+            unsafe_allow_html=True)
+
+# ----------------------------------------------------------------------
+# Carga de archivo (principal + sidebar; ambos comparten la misma fuente)
+# ----------------------------------------------------------------------
+tipos = ["csv", "xlsx", "xls"]
+sub_sidebar = st.sidebar.file_uploader("📂 Cargar CSV/Excel (uno o varios)", type=tipos,
+                                       accept_multiple_files=True, key="up_side")
+sub_main = st.file_uploader("📂 Cargar o actualizar archivos de rutas (podés subir varios CSV/Excel)",
+                            type=tipos, accept_multiple_files=True, key="up_main")
+
+# Ambos uploaders alimentan el dashboard; si un archivo está en los dos, se usa una sola vez
+archivos, vistos = [], set()
+for a in list(sub_main or []) + list(sub_sidebar or []):
+    if (a.name, a.size) not in vistos:
+        vistos.add((a.name, a.size))
+        archivos.append(a)
+
+resumen_archivos = pd.DataFrame()
+if archivos:
+    bruto, resumen_archivos = unir_archivos(archivos)
+    if bruto.empty:
+        st.error("Ningún archivo pudo leerse.")
+        st.stop()
+    dup = st.session_state.get("duplicadas", 0)
+    origen = f"{len(resumen_archivos)} archivo(s) cargado(s) · {len(bruto)} filas"
+    if dup:
+        origen += f" · {dup} filas repetidas descartadas"
+elif Path(ARCHIVO_DEFECTO).exists():
+    bruto = leer_archivo(ARCHIVO_DEFECTO)
+    origen = f"Archivo local: {ARCHIVO_DEFECTO}"
+else:
+    bruto = datos_demo()
+    origen = "Datos de demostración (cargá uno o varios archivos para ver datos reales)"
+st.caption(origen)
+if not resumen_archivos.empty:
+    with st.expander("Archivos incluidos"):
+        st.dataframe(resumen_archivos, use_container_width=True, hide_index=True)
+
+datos = preparar(bruto)
+if datos.empty:
+    st.warning("No hay visitas con registro de llegada para evaluar.")
     st.stop()
-asist_all, info = preparar_respuestas(raw_resp)
-asist_all = asist_all[~asist_all["key"].isin({norm_key(n) for n in EXCLUIDOS})]
-vac_df = preparar_vacaciones(raw_vac)
-if len(vac_df):  # ignorar también las ausencias cargadas para las personas excluidas
-    vac_df = vac_df[vincular_vacaciones(vac_df, {norm_key(n): n for n in EXCLUIDOS})["key"].eq("").values]
-if raw_vac is None:
-    st.warning(f"No pude leer la pestaña '{WS_VACACIONES}'. Se calcula sin excepciones de vacaciones.")
 
-# ───────────────────────── FILTROS ─────────────────────────
-sb = st.sidebar
-sb.header("Filtros")
-if sb.button("🔄 Actualizar datos"):
-    st.cache_data.clear()
-    st.rerun()
+# ----------------------------------------------------------------------
+# Filtros (sidebar)
+# ----------------------------------------------------------------------
+st.sidebar.header("Filtros")
+frecuencia = st.sidebar.radio("Frecuencia", ["Diario", "Semanal", "Mensual"], horizontal=True)
 
-anios = sorted(asist_all["anio"].unique())
-anio = sb.selectbox("Año", anios, index=len(anios) - 1)
-base = asist_all[asist_all["anio"] == anio]
-fmin, fmax = base["fecha"].min().date(), base["fecha"].max().date()
-rango = sb.date_input("Rango de fechas", (fmin, fmax), min_value=fmin, max_value=fmax, format="DD/MM/YYYY")
-if not isinstance(rango, (tuple, list)) or len(rango) != 2:
-    st.info("Elegí fecha de inicio y de fin en el filtro de la izquierda.")
-    st.stop()
-d1, d2 = rango
-meses_sel = sb.multiselect("Mes", sorted(base["mes"].unique()), format_func=lambda m: MESES[m - 1])
-sem_sel = sb.multiselect("Semana", sorted(base["semana"].unique()))
+f_min, f_max = datos["fecha"].min().date(), datos["fecha"].max().date()
+rango = st.sidebar.date_input("Fecha / rango", value=(f_min, f_max), min_value=f_min, max_value=f_max)
+if isinstance(rango, tuple) and len(rango) == 2:
+    desde, hasta = rango
+else:
+    desde = hasta = rango[0] if isinstance(rango, tuple) else rango
 
-# Listado de personas: solo los nombres de la pestaña "Respuestas de formulario 1"
-roster = (base.sort_values("fecha").groupby("key")
-          .agg(persona=("persona", "last")).reset_index()
-          .sort_values("persona").reset_index(drop=True))
-vac_df = vincular_vacaciones(vac_df, dict(zip(roster["key"], roster["persona"])))
+choferes = sorted(datos["driver_name"].dropna().unique())
+sel_ch = st.sidebar.multiselect("Chofer", choferes, default=choferes)
+planillas = sorted(datos["tour_display_id"].dropna().astype(str).unique())
+sel_pl = st.sidebar.multiselect("Planilla / Ruta", planillas, default=planillas)
 
-nombres_sel = sb.multiselect("Nombre", list(roster["persona"]), placeholder="Todas las personas")
-q = sb.text_input("Buscar nombre / apellido")
-excluir_en_curso = sb.checkbox("Excluir semana en curso del cálculo", value=True,
-                               help="La semana que todavía no terminó penalizaría el cumplimiento.")
-
-if nombres_sel:
-    roster = roster[roster["persona"].isin(nombres_sel)]
-if q.strip():
-    roster = roster[roster["key"].str.contains(norm_key(q), regex=False)]
-if roster.empty:
-    st.warning("Ningún registro coincide con los filtros.")
+mask = (
+    (datos["fecha"].dt.date >= desde) & (datos["fecha"].dt.date <= hasta)
+    & datos["driver_name"].isin(sel_ch)
+    & datos["tour_display_id"].astype(str).isin(sel_pl)
+)
+d = asignar_periodo(datos[mask], frecuencia)
+if d.empty:
+    st.info("Sin datos para los filtros seleccionados.")
     st.stop()
 
-recs = base[(base["fecha"].dt.date >= d1) & (base["fecha"].dt.date <= d2)]
-if meses_sel:
-    recs = recs[recs["mes"].isin(meses_sel)]
-if sem_sel:
-    recs = recs[recs["semana"].isin(sem_sel)]
-if recs.empty:
-    st.warning("No hay marcas en el período elegido.")
-    st.stop()
+# ----------------------------------------------------------------------
+# Tarjeta consolidada
+# ----------------------------------------------------------------------
+g2, g5 = pct(d["cumple_2"]), pct(d["cumple_5"])
+etiqueta = f"{desde:%d/%m/%Y}" if desde == hasta else f"{desde:%d/%m/%Y} - {hasta:%d/%m/%Y}"
+st.markdown(f"**FECHA:** {etiqueta}")
 
-semanas_tbl = (recs.groupby("semana")
-               .agg(desde=("fecha", "min"), hasta=("fecha", "max"), dias=("fecha", "nunique"),
-                    mes=("mes", lambda s: int(s.mode().iat[0])))
-               .reset_index().sort_values("desde"))
-hoy = date.today().isocalendar()
-if excluir_en_curso and anio == hoy.year:
-    semanas_tbl = semanas_tbl[semanas_tbl["semana"] != hoy.week]
-if semanas_tbl.empty:
-    st.warning("No quedan semanas completas para evaluar con estos filtros.")
-    st.stop()
+# ----------------------------------------------------------------------
+# Tabla por chofer
+# ----------------------------------------------------------------------
+tabla = (
+    d.groupby("driver_name")
+    .agg(Clientes=("arrived_at", "size"), c2=("cumple_2", "mean"), c5=("cumple_5", "mean"))
+    .reset_index()
+    .rename(columns={"driver_name": "CHOFER",
+                     "c2": "Notificaciones mayores a 2 minutos",
+                     "c5": "Notificaciones mayores a 5 minutos"})
+)
+tabla["Notificaciones mayores a 2 minutos"] *= 100
+tabla["Notificaciones mayores a 5 minutos"] *= 100
+tabla = tabla.sort_values("Notificaciones mayores a 2 minutos", ascending=False).reset_index(drop=True)
 
-recs_eval = recs[recs["semana"].isin(semanas_tbl["semana"])]
-vac_set = set(zip(vac_df["key"], vac_df["semana"]))
+# Fila GENERAL al inicio de la misma tabla (hace de encabezado con el puntaje global)
+general = pd.DataFrame([{
+    "CHOFER": "GENERAL",
+    "Clientes": len(d),
+    "Notificaciones mayores a 2 minutos": g2,
+    "Notificaciones mayores a 5 minutos": g5,
+}])
+tabla = pd.concat([general, tabla], ignore_index=True)
 
-# ───────────────────────── CÁLCULO ─────────────────────────
-grid = roster[["key", "persona"]].merge(semanas_tbl[["semana", "mes"]], how="cross")
-cnt = recs_eval.groupby(["key", "semana"]).size().rename("asistencias").reset_index()
-grid = grid.merge(cnt, on=["key", "semana"], how="left")
-grid["asistencias"] = grid["asistencias"].fillna(0).astype(int)
-grid["vac"] = [(k, s) in vac_set for k, s in zip(grid["key"], grid["semana"])]
-grid["pct"] = np.where(grid["vac"], np.nan, grid["asistencias"].clip(upper=UMBRAL) / UMBRAL * 100)
-grid["cumple"] = (~grid["vac"]) & (grid["asistencias"] >= UMBRAL)
+tab1, tab2, tab3 = st.tabs(["📋 Por chofer", "📈 Evolución", "⚠️ Visitas < 2 min"])
 
-res = grid.groupby("key").agg(activas=("vac", lambda s: int((~s).sum())), vacs=("vac", "sum"),
-                              cumplidas=("cumple", "sum"), pct=("pct", "mean")).reset_index()
-tot = recs_eval.groupby("key").size().rename("total").reset_index()
-res = roster.merge(res, on="key", how="left").merge(tot, on="key", how="left")
-res["total"] = res["total"].fillna(0).astype(int)
+with tab1:
+    html_tabla, alto_tabla = tabla_componente(tabla)
+    components.html(html_tabla, height=alto_tabla, scrolling=True)
+    st.caption("Hacé clic en un encabezado para ordenar (▲▼). La fila GENERAL queda fija arriba.")
+    st.download_button("⬇️ Descargar Excel", a_excel(tabla.round(1)), "notificacion_por_chofer.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# ───────────────────────── KPIs ─────────────────────────
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Personas", len(roster))
-k2.metric("Asistencias válidas", int(res["total"].sum()))
-k3.metric("Semanas evaluadas", len(semanas_tbl))
-k4.metric("Cumplimiento global", f"{grid['pct'].mean():.0f}%" if grid["pct"].notna().any() else "—")
-st.caption(f"Regla: mínimo {UMBRAL} asistencias por semana = 100%; menos se calcula proporcional. "
-           "Las semanas en vacaciones/ausente/suspendido no entran en el denominador. "
-           "Máximo 1 asistencia por persona y día.")
+with tab2:
+    evo = (d.groupby("periodo")
+             .agg(**{"% > 2 min": ("cumple_2", "mean"), "% > 5 min": ("cumple_5", "mean")})
+             .mul(100).reset_index())
+    fig = px.line(evo.melt("periodo", var_name="Métrica", value_name="%"),
+                  x="periodo", y="%", color="Métrica", markers=True,
+                  color_discrete_sequence=["#D32F2F", "#F9A825"])
+    fig.add_hline(y=OBJETIVO, line_dash="dash", line_color="green", annotation_text=f"Objetivo {OBJETIVO:.0f}%")
+    fig.update_layout(yaxis_range=[0, 105], xaxis_title=frecuencia, yaxis_title="% cumplimiento")
+    st.plotly_chart(fig, use_container_width=True)
 
-t_gen, t_dia, t_sem, t_mes, t_diag = st.tabs(
-    ["👥 Matriz general", "📅 Día", "🗓️ Semana", "📆 Mes", "🔍 Diagnóstico"])
+    # --- Evolución a lo largo del horario del día ---
+    st.subheader("Evolución según la hora del día")
+    hor = (d.groupby("hora")
+             .agg(Visitas=("arrived_at", "size"),
+                  **{"% > 2 min": ("cumple_2", "mean"), "% > 5 min": ("cumple_5", "mean")})
+             .reset_index())
+    hor[["% > 2 min", "% > 5 min"]] *= 100
+    hor["Franja"] = hor["hora"].astype(str).str.zfill(2) + ":00"
 
-# ───────────────────────── MATRIZ GENERAL ─────────────────────────
-with t_gen:
-    st.subheader("Listado completo de personas")
-    m = res.rename(columns={"persona": "Persona", "total": "Total asistencias",
-                            "activas": "Semanas activas", "vacs": "Semanas vacaciones/licencia",
-                            "cumplidas": "Semanas cumplidas", "pct": "% Cumplimiento"})
-    m["Estado"] = m["% Cumplimiento"].map(estado)
-    mostrar_pct(m[["Persona", "Total asistencias", "Semanas activas",
-                   "Semanas vacaciones/licencia", "Semanas cumplidas", "% Cumplimiento", "Estado"]],
-                ["% Cumplimiento"])
-    st.download_button("⬇️ Descargar CSV", m.to_csv(index=False).encode("utf-8-sig"),
-                       "cumplimiento_general.csv", "text/csv")
+    fig_h = px.line(hor.melt(["hora", "Franja", "Visitas"], var_name="Métrica", value_name="%"),
+                    x="Franja", y="%", color="Métrica", markers=True, hover_data=["Visitas"],
+                    color_discrete_sequence=["#D32F2F", "#F9A825"])
+    fig_h.add_hline(y=OBJETIVO, line_dash="dash", line_color="green", annotation_text=f"Objetivo {OBJETIVO:.0f}%")
+    fig_h.update_layout(yaxis_range=[0, 105], xaxis_title="Hora de llegada al cliente (hora local)",
+                        yaxis_title="% cumplimiento")
+    st.plotly_chart(fig_h, use_container_width=True)
 
-# ───────────────────────── DÍA ─────────────────────────
-with t_dia:
-    fechas = sorted(recs["fecha"].dt.date.unique(), reverse=True)
-    dia = st.selectbox("Fecha", fechas, format_func=lambda d: d.strftime("%d/%m/%Y"))
-    del_dia = recs[recs["fecha"].dt.date == dia]
-    sem_dia = int(del_dia["semana"].mode().iat[0])
-    horas = del_dia.set_index("key")["hora"]
-    d = roster[["key", "persona"]].copy()
-    d["hora"] = d["key"].map(horas)
-    d["vac"] = [(k, sem_dia) in vac_set for k in d["key"]]
-    d["Estado"] = np.where(d["hora"].notna(), "✅ Asistió",
-                           np.where(d["vac"], "🏖 Vacaciones/Ausente", "❌ No asistió"))
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Asistieron", int((d["Estado"] == "✅ Asistió").sum()))
-    c2.metric("No asistieron", int((d["Estado"] == "❌ No asistió").sum()))
-    c3.metric("Vacaciones / Ausente", int((d["Estado"] == "🏖 Vacaciones/Ausente").sum()))
-    filtro = st.radio("Mostrar", ["Todos", "Solo asistieron", "Solo no asistieron"], horizontal=True)
-    if filtro == "Solo asistieron":
-        d = d[d["Estado"] == "✅ Asistió"]
-    elif filtro == "Solo no asistieron":
-        d = d[d["Estado"] == "❌ No asistió"]
-    mostrar(d.rename(columns={"persona": "Persona", "hora": "Hora de marca"})
-            [["Persona", "Estado", "Hora de marca"]])
-    st.markdown("**Asistentes por día (período filtrado)**")
-    st.bar_chart(recs[recs["key"].isin(roster["key"])].groupby("fecha").size())
+    fig_v = px.bar(hor, x="Franja", y="Visitas", color_discrete_sequence=["#FFC933"])
+    fig_v.update_layout(height=220, xaxis_title=None, yaxis_title="Visitas evaluadas")
+    st.plotly_chart(fig_v, use_container_width=True)
 
-# ───────────────────────── SEMANA ─────────────────────────
-with t_sem:
-    grid["celda"] = [("🏖 Vac." if v else (f"{n} ✅" if n >= UMBRAL else f"{n} ⚠️"))
-                     for n, v in zip(grid["asistencias"], grid["vac"])]
-    piv = grid.pivot(index="persona", columns="semana", values="celda")
-    piv.columns = [f"S{c}" for c in piv.columns]
-    piv = piv.reset_index().rename(columns={"persona": "Persona"})
-    st.caption(f"✅ = {UMBRAL} o más asistencias · ⚠️ = menos de {UMBRAL} · 🏖 = vacaciones/ausente/suspendido (no se evalúa)")
-    mostrar(piv.style.map(estilo_celda, subset=[c for c in piv.columns if c.startswith("S")]))
-    st.markdown("**Cumplimiento promedio por semana**")
-    st.line_chart(grid.groupby("semana")["pct"].mean().rename(index=lambda s: f"S{s}"))
-    st.markdown("**Semanas del período**")
-    sw = semanas_tbl.assign(desde=lambda x: x["desde"].dt.strftime("%d/%m"), hasta=lambda x: x["hasta"].dt.strftime("%d/%m"),
-                            mes=lambda x: x["mes"].map(lambda m: MESES[m - 1]))
-    mostrar(sw.rename(columns={"semana": "Semana", "desde": "Primer día", "hasta": "Último día",
-                               "dias": "Días con marcas", "mes": "Mes"}))
-
-# ───────────────────────── MES ─────────────────────────
-with t_mes:
-    gm = grid.groupby(["key", "mes"])["pct"].mean().unstack("mes")
-    gm.columns = [MESES[int(c) - 1] for c in gm.columns]
-    gm = roster[["key", "persona"]].merge(gm.reset_index(), on="key", how="left")
-    gm = gm.merge(res[["key", "pct"]], on="key").drop(columns="key")
-    gm = gm.rename(columns={"persona": "Persona", "pct": "Total período"})
-    cols_pct = [c for c in gm.columns if c != "Persona"]
-    st.caption("Cada mes agrega los resultados semanales (semanas asignadas al mes con más días de marcas).")
-    mostrar_pct(gm, cols_pct)
-
-# ───────────────────────── DIAGNÓSTICO ─────────────────────────
-with t_diag:
-    st.write(f"Filas leídas: **{info['filas']}** · filas inválidas descartadas: **{info['invalidas']}** · "
-             f"marcas duplicadas (misma persona y día) unificadas: **{info['duplicadas']}**")
-    if info["desfase_mes"]:
-        st.warning(f"{info['desfase_mes']} filas tienen un mes en 'Fecha' distinto a la columna 'Mes'. "
-                   "Revisá el formato de fecha (debe ser día/mes/año).")
-    sin_match = vac_df[vac_df["key"] == ""]["persona"].drop_duplicates()
-    if len(sin_match):
-        st.warning("Estos nombres de la pestaña de vacaciones no coinciden con una única persona de 'Respuestas' "
-                   "y NO se aplicaron: " + ", ".join(sin_match))
-    st.markdown("**Vacaciones / ausencias interpretadas**")
-    mostrar(vac_df.drop(columns="key").rename(columns={"persona": "Persona", "semana": "Semana", "motivo": "Motivo"}))
+with tab3:
+    inc = d[~d["cumple_2"]].copy()
+    inc["Anticipación (seg)"] = inc["anticipacion_seg"].round(0)
+    inc["arrived_at"] = inc["arrived_at"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    vista = (inc[["fecha", "driver_name", "tour_display_id", "arrived_at", "Anticipación (seg)"]]
+             .rename(columns={"fecha": "Fecha", "driver_name": "Chofer",
+                              "tour_display_id": "Planilla", "arrived_at": "Llegada"})
+             .sort_values("Anticipación (seg)", na_position="first"))
+    vista["Fecha"] = vista["Fecha"].dt.strftime("%Y-%m-%d")
+    st.caption(f"{len(vista)} visitas sin cumplir (vacío = sin notificación registrada).")
+    st.dataframe(vista, use_container_width=True, hide_index=True)
